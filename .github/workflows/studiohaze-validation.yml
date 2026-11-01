@@ -1,0 +1,71 @@
+name: Validate Topaz and Lispex
+on:
+  push:
+    branches: [validate-topaz-lispex]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      HELIX_DISABLE_AUTO_GRAMMAR_BUILD: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Validate grammar queries before building
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/query-tools
+          /tmp/query-tools/bin/pip -q install tree-sitter==0.25.2
+          git clone -q https://github.com/studiohaze/tree-sitter-topaz /tmp/topaz-grammar
+          git -C /tmp/topaz-grammar checkout -q 8589aaedcead8e66a69429ae69cc6916a49707d4
+          git clone -q https://github.com/studiohaze/tree-sitter-lispex /tmp/lispex-grammar
+          git -C /tmp/lispex-grammar checkout -q af2148b9e2b64185c6f192832bc92dd68dbb60f4
+          for lang in topaz lispex; do
+            cc -shared -fPIC -O0 -I /tmp/$lang-grammar/src /tmp/$lang-grammar/src/parser.c /tmp/$lang-grammar/src/scanner.c -o /tmp/$lang.so
+          done
+          /tmp/query-tools/bin/python .github/studiohaze/preflight.py
+      - name: Build and verify Helix
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir /tmp/helix-heavy.lock
+          trap 'rmdir /tmp/helix-heavy.lock' EXIT
+          require_memory() { test "$(awk '/MemAvailable/ {print $2}' /proc/meminfo)" -ge 3670016; }
+          rustup toolchain install stable --profile minimal
+          require_memory
+          cargo +stable build --locked --jobs 1 -p helix-term -p xtask
+          export HELIX_RUNTIME="$PWD/runtime"
+          export XDG_CONFIG_HOME=/tmp/helix-config
+          mkdir -p "$XDG_CONFIG_HOME/helix"
+          printf 'use-grammars = { only = ["topaz", "lispex"] }\n' > "$XDG_CONFIG_HOME/helix/languages.toml"
+          npm install --prefix /tmp/topaz-cli --no-audit --no-fund topaz-lang@5.21.2
+          export PATH="/tmp/topaz-cli/node_modules/.bin:$PATH"
+          target/debug/hx --version
+          target/debug/hx --grammar fetch
+          require_memory
+          target/debug/hx --grammar build
+          target/debug/hx --health topaz
+          target/debug/hx --health lispex
+          require_memory
+          cargo +stable xtask query-check topaz lispex
+          require_memory
+          cargo +stable xtask highlight-check --dump topaz .github/studiohaze/topaz.tpz
+          require_memory
+          cargo +stable xtask highlight-check --dump lispex .github/studiohaze/lispex.lspx
+          require_memory
+          cargo +stable xtask docgen
+          echo DOCGEN_PATCH_START
+          git diff -- book/src/generated | base64 -w0
+          echo
+          echo DOCGEN_PATCH_END
+          git diff --check
